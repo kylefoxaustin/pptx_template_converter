@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude Code local state
+.claude/
+
+# PowerPoint files — NEVER commit real templates, inputs, or outputs.
+# This is a privacy guard: the project is designed to leave real corporate
+# templates on the user's machine only.
+*.pptx
+*.potx
+*.ppt
+*.pps
+*.ppsx
+
+# Exceptions: the two committed synthetic fixtures used for testing.
+!input/sample_input.pptx
+!template/sample_template.pptx
+
+# The output directory is for generated artifacts only — never commit its contents.
+/output/*
+!/output/.gitkeep
