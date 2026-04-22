@@ -58,8 +58,13 @@ SCHEME_TO_MSO = {
 }
 HEX_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
-# Title detection: require the "title" shape's font size to exceed the next-largest
-# size by at least this factor, or we skip recoloring (too ambiguous).
+# Title detection: a shape has to span at least this fraction of the slide width
+# to be considered a title candidate. Titles typically run nearly the full width;
+# decorative stat boxes / column cards span ~1/3.
+TITLE_MIN_WIDTH_FRACTION = 0.50
+
+# Fallback (no shape meets the width bar): require the biggest-font shape to
+# exceed the next-largest by at least this factor before we treat it as a title.
 TITLE_SIZE_RATIO = 1.15
 
 
@@ -372,32 +377,52 @@ def _read_master_title_color(pres):
     return None
 
 
-def _detect_title_shape(slide):
-    """Pick the shape that looks like a title: largest run font size, clear margin over body.
+def _detect_title_shape(slide, slide_width, slide_height):
+    """Pick the shape that looks like a title.
 
-    Returns the python-pptx shape or None if ambiguous / no text.
+    Primary heuristic: the *topmost shape that spans most of the slide width*
+    is the title. Titles are authored full-width near the top; decorative stat
+    cards / column boxes are narrower even when their font is larger.
+
+    Fallback (no wide shape — unusual layouts): the overall largest-font shape,
+    but only if it beats the next-largest by TITLE_SIZE_RATIO so we don't
+    mislabel one of several evenly-sized body lines.
     """
-    candidates = []
+    width_threshold = slide_width * TITLE_MIN_WIDTH_FRACTION
+    wide_candidates: list[tuple[int, float, object]] = []  # (top, max_size, shape)
+    all_candidates: list[tuple[float, int, object]] = []   # (max_size, top, shape)
+
     for sh in slide.shapes:
         if not sh.has_text_frame:
             continue
+        text = (sh.text_frame.text or "").strip()
+        if not text:
+            continue  # empty textboxes would steal "topmost" from the real title
         max_size = 0.0
         for para in sh.text_frame.paragraphs:
             for run in para.runs:
                 size = run.font.size
-                if size is not None:
-                    size_pt = size.pt
-                    if size_pt > max_size:
-                        max_size = size_pt
-        if max_size > 0:
-            candidates.append((max_size, sh.top if sh.top is not None else 0, sh))
-    if not candidates:
+                if size is not None and size.pt > max_size:
+                    max_size = size.pt
+        top = sh.top if sh.top is not None else 0
+        width = sh.width if sh.width is not None else 0
+        all_candidates.append((max_size, top, sh))
+        if width >= width_threshold:
+            wide_candidates.append((top, max_size, sh))
+
+    if wide_candidates:
+        wide_candidates.sort(key=lambda c: (c[0], -c[1]))
+        return wide_candidates[0][2]
+
+    if not all_candidates:
         return None
-    candidates.sort(key=lambda c: (-c[0], c[1]))
-    best_size, _, best_shape = candidates[0]
-    other_sizes = [c[0] for c in candidates[1:] if c[0] < best_size]
+    all_candidates.sort(key=lambda c: (-c[0], c[1]))
+    best_size, _, best_shape = all_candidates[0]
+    if best_size == 0:
+        return None
+    other_sizes = [c[0] for c in all_candidates[1:] if c[0] < best_size]
     if other_sizes and best_size < other_sizes[0] * TITLE_SIZE_RATIO:
-        return None  # not enough separation from body text — skip
+        return None
     return best_shape
 
 
@@ -415,8 +440,10 @@ def _apply_title_color(shape, color_spec):
 def _recolor_titles(pres, color_spec):
     """Apply color_spec to the detected title shape on every slide. Return log tuples."""
     log = []
+    slide_width = pres.slide_width
+    slide_height = pres.slide_height
     for idx, slide in enumerate(pres.slides):
-        title_shape = _detect_title_shape(slide)
+        title_shape = _detect_title_shape(slide, slide_width, slide_height)
         if title_shape is None:
             continue
         _apply_title_color(title_shape, color_spec)
