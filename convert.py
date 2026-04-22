@@ -19,26 +19,53 @@ from pathlib import Path
 
 from lxml import etree
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.dml import MSO_THEME_COLOR
 from pptx.oxml.ns import qn
 from pptx.parts.image import Image, ImagePart
 
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 SRGB_RE = re.compile(r'srgbClr\s+val="([0-9A-Fa-f]{6})"')
 
 # spTree children that must stay put when we wipe a slide's default shapes.
 GROUP_FRAME_TAGS = {qn("p:nvGrpSpPr"), qn("p:grpSpPr")}
 
 THEME_COLOR_NAMES = {
-    "dk1", "lt1", "dk2", "lt2",
+    "dk1", "lt1", "dk2", "lt2", "tx1", "tx2", "bg1", "bg2",
     "accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
     "hlink", "folHlink",
 }
+
+SCHEME_TO_MSO = {
+    "dk1": MSO_THEME_COLOR.DARK_1,
+    "lt1": MSO_THEME_COLOR.LIGHT_1,
+    "dk2": MSO_THEME_COLOR.DARK_2,
+    "lt2": MSO_THEME_COLOR.LIGHT_2,
+    "tx1": MSO_THEME_COLOR.TEXT_1,
+    "tx2": MSO_THEME_COLOR.TEXT_2,
+    "bg1": MSO_THEME_COLOR.BACKGROUND_1,
+    "bg2": MSO_THEME_COLOR.BACKGROUND_2,
+    "accent1": MSO_THEME_COLOR.ACCENT_1,
+    "accent2": MSO_THEME_COLOR.ACCENT_2,
+    "accent3": MSO_THEME_COLOR.ACCENT_3,
+    "accent4": MSO_THEME_COLOR.ACCENT_4,
+    "accent5": MSO_THEME_COLOR.ACCENT_5,
+    "accent6": MSO_THEME_COLOR.ACCENT_6,
+    "hlink": MSO_THEME_COLOR.HYPERLINK,
+    "folHlink": MSO_THEME_COLOR.FOLLOWED_HYPERLINK,
+}
 HEX_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+
+# Title detection: require the "title" shape's font size to exceed the next-largest
+# size by at least this factor, or we skip recoloring (too ambiguous).
+TITLE_SIZE_RATIO = 1.15
 
 
 def convert(src_path: Path, tpl_path: Path, out_path: Path,
-            color_map_path: Path | None = None) -> None:
+            color_map_path: Path | None = None,
+            title_color: str = "auto") -> None:
     src = Presentation(src_path)
     dst = Presentation(tpl_path)
 
@@ -65,6 +92,8 @@ def convert(src_path: Path, tpl_path: Path, out_path: Path,
     if color_map_path:
         print(f"[info] loaded {len(color_map)} color mappings from {color_map_path}")
 
+    title_color_spec = _resolve_title_color(title_color, dst)
+
     _delete_all_slides(dst)
 
     per_slide_report: list[tuple[int, dict[str, set[str]]]] = []
@@ -75,10 +104,13 @@ def convert(src_path: Path, tpl_path: Path, out_path: Path,
         _copy_shapes(src_slide, new_slide, rid_map, color_map)
         per_slide_report.append((idx, _categorize_colors(src_slide, color_map)))
 
+    title_log = _recolor_titles(dst, title_color_spec) if title_color_spec else []
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dst.save(out_path)
     print(f"[done] wrote {out_path}")
     _print_color_report(per_slide_report, theme_colors, bool(color_map))
+    _print_title_report(title_log, title_color_spec)
 
 
 def _find_blank_layout(pres):
@@ -282,6 +314,134 @@ def _print_color_report(per_slide_report, theme_colors, used_color_map: bool):
         print("  " + ", ".join("#" + c for c in sorted(all_unmapped)))
 
 
+def _resolve_title_color(spec: str, pres):
+    """Return a resolved title color or None (skip title recoloring).
+
+    spec is one of:
+      'auto'   — read from the template's master titleStyle; fallback accent1.
+      'none'   — skip the title recoloring pass entirely.
+      'dk1' .. — a theme color slot name.
+      '#RRGGBB' — a hex literal.
+    Return value: ('scheme', <slot>) or ('srgb', <HEX>) or None.
+    """
+    if spec == "none":
+        return None
+    if spec == "auto":
+        resolved = _read_master_title_color(pres)
+        if resolved is None:
+            print("[info] could not read title color from template master; defaulting to accent1")
+            return ("scheme", "accent1")
+        print(f"[info] template title color detected: {resolved[0]}={resolved[1]}")
+        return resolved
+    if spec.startswith("#"):
+        hex_ = spec.lstrip("#").upper()
+        if not HEX_RE.match(hex_):
+            raise SystemExit(f"Invalid --title-color hex: {spec}")
+        return ("srgb", hex_)
+    if spec in THEME_COLOR_NAMES:
+        return ("scheme", spec)
+    raise SystemExit(
+        f"Invalid --title-color: {spec!r}. Use a theme slot name "
+        f"({', '.join(sorted(THEME_COLOR_NAMES))}), '#RRGGBB', 'auto', or 'none'."
+    )
+
+
+def _read_master_title_color(pres):
+    """Read the master's titleStyle level-1 solid fill, as a ('scheme'|'srgb', value) tuple."""
+    master = pres.slide_masters[0]
+    title_style = master.element.find(f".//{{{P_NS}}}titleStyle")
+    if title_style is None:
+        return None
+    lvl1 = title_style.find(f"{{{A_NS}}}lvl1pPr")
+    if lvl1 is None:
+        return None
+    def_rpr = lvl1.find(f"{{{A_NS}}}defRPr")
+    if def_rpr is None:
+        return None
+    fill = def_rpr.find(f"{{{A_NS}}}solidFill")
+    if fill is None:
+        return None
+    scheme = fill.find(f"{{{A_NS}}}schemeClr")
+    if scheme is not None:
+        val = scheme.get("val")
+        if val in THEME_COLOR_NAMES:
+            return ("scheme", val)
+    srgb = fill.find(f"{{{A_NS}}}srgbClr")
+    if srgb is not None:
+        return ("srgb", srgb.get("val").upper())
+    return None
+
+
+def _detect_title_shape(slide):
+    """Pick the shape that looks like a title: largest run font size, clear margin over body.
+
+    Returns the python-pptx shape or None if ambiguous / no text.
+    """
+    candidates = []
+    for sh in slide.shapes:
+        if not sh.has_text_frame:
+            continue
+        max_size = 0.0
+        for para in sh.text_frame.paragraphs:
+            for run in para.runs:
+                size = run.font.size
+                if size is not None:
+                    size_pt = size.pt
+                    if size_pt > max_size:
+                        max_size = size_pt
+        if max_size > 0:
+            candidates.append((max_size, sh.top if sh.top is not None else 0, sh))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    best_size, _, best_shape = candidates[0]
+    other_sizes = [c[0] for c in candidates[1:] if c[0] < best_size]
+    if other_sizes and best_size < other_sizes[0] * TITLE_SIZE_RATIO:
+        return None  # not enough separation from body text — skip
+    return best_shape
+
+
+def _apply_title_color(shape, color_spec):
+    kind, value = color_spec
+    for para in shape.text_frame.paragraphs:
+        for run in para.runs:
+            color = run.font.color
+            if kind == "scheme":
+                color.theme_color = SCHEME_TO_MSO[value]
+            else:
+                color.rgb = RGBColor.from_string(value.lstrip("#"))
+
+
+def _recolor_titles(pres, color_spec):
+    """Apply color_spec to the detected title shape on every slide. Return log tuples."""
+    log = []
+    for idx, slide in enumerate(pres.slides):
+        title_shape = _detect_title_shape(slide)
+        if title_shape is None:
+            continue
+        _apply_title_color(title_shape, color_spec)
+        snippet = (title_shape.text_frame.text.strip().replace("\n", " ") or "")[:60]
+        log.append((idx + 1, snippet))
+    return log
+
+
+def _print_title_report(log, color_spec):
+    print()
+    print("=== Title recolor report ===")
+    if color_spec is None:
+        print("(skipped — title recoloring disabled)")
+        return
+    kind, value = color_spec
+    target = f"{kind}={value}" if kind == "scheme" else f"#{value}"
+    if not log:
+        print(f"(no slides matched the title heuristic; font-size gaps too small)")
+        print(f"Target color was: {target}")
+        return
+    print(f"Applied color {target} to {len(log)} slide title(s):")
+    for slide_num, text in log:
+        print(f"  slide {slide_num}: {text!r}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True, type=Path, help="Source .pptx")
@@ -290,13 +450,17 @@ def main():
     ap.add_argument("--color-map", type=Path, default=None,
                     help="Optional JSON file mapping source hex colors to template theme slots "
                          "or hex literals. See mappings/keyhole_to_corporate.json for an example.")
+    ap.add_argument("--title-color", default="auto",
+                    help="Color for detected slide titles: 'auto' (read from template master), "
+                         "'none' (skip), a theme slot name (e.g. 'accent1'), or '#RRGGBB'.")
     args = ap.parse_args()
     for label, p in (("input", args.input), ("template", args.template)):
         if not p.exists():
             ap.error(f"{label} not found: {p}")
     if args.color_map is not None and not args.color_map.exists():
         ap.error(f"color-map not found: {args.color_map}")
-    convert(args.input, args.template, args.output, color_map_path=args.color_map)
+    convert(args.input, args.template, args.output,
+            color_map_path=args.color_map, title_color=args.title_color)
 
 
 if __name__ == "__main__":
