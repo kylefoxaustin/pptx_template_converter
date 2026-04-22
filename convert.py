@@ -63,6 +63,10 @@ HEX_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 # decorative stat boxes / column cards span ~1/3.
 TITLE_MIN_WIDTH_FRACTION = 0.50
 
+# Subtitle detection: the subtitle candidate must sit in the upper portion of
+# the slide so we don't mistake a wide footer for a subtitle.
+SUBTITLE_MAX_TOP_FRACTION = 0.60
+
 # Fallback (no shape meets the width bar): require the biggest-font shape to
 # exceed the next-largest by at least this factor before we treat it as a title.
 TITLE_SIZE_RATIO = 1.15
@@ -70,7 +74,8 @@ TITLE_SIZE_RATIO = 1.15
 
 def convert(src_path: Path, tpl_path: Path, out_path: Path,
             color_map_path: Path | None = None,
-            title_color: str = "auto") -> None:
+            title_color: str = "auto",
+            subtitle_color: str = "auto") -> None:
     src = Presentation(src_path)
     dst = Presentation(tpl_path)
 
@@ -97,7 +102,8 @@ def convert(src_path: Path, tpl_path: Path, out_path: Path,
     if color_map_path:
         print(f"[info] loaded {len(color_map)} color mappings from {color_map_path}")
 
-    title_color_spec = _resolve_title_color(title_color, dst)
+    title_spec = _resolve_style_color(title_color, dst, "title")
+    subtitle_spec = _resolve_style_color(subtitle_color, dst, "subtitle")
 
     _delete_all_slides(dst)
 
@@ -109,13 +115,14 @@ def convert(src_path: Path, tpl_path: Path, out_path: Path,
         _copy_shapes(src_slide, new_slide, rid_map, color_map)
         per_slide_report.append((idx, _categorize_colors(src_slide, color_map)))
 
-    title_log = _recolor_titles(dst, title_color_spec) if title_color_spec else []
+    title_log, subtitle_log = _recolor_titles_and_subtitles(dst, title_spec, subtitle_spec)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dst.save(out_path)
     print(f"[done] wrote {out_path}")
     _print_color_report(per_slide_report, theme_colors, bool(color_map))
-    _print_title_report(title_log, title_color_spec)
+    _print_style_report(title_log, title_spec, "title")
+    _print_style_report(subtitle_log, subtitle_spec, "subtitle")
 
 
 def _find_blank_layout(pres):
@@ -319,45 +326,46 @@ def _print_color_report(per_slide_report, theme_colors, used_color_map: bool):
         print("  " + ", ".join("#" + c for c in sorted(all_unmapped)))
 
 
-def _resolve_title_color(spec: str, pres):
-    """Return a resolved title color or None (skip title recoloring).
+def _resolve_style_color(spec: str, pres, kind: str):
+    """Resolve --title-color / --subtitle-color. Returns ('scheme'|'srgb', value) or None.
 
-    spec is one of:
-      'auto'   — read from the template's master titleStyle; fallback accent1.
-      'none'   — skip the title recoloring pass entirely.
-      'dk1' .. — a theme color slot name.
-      '#RRGGBB' — a hex literal.
-    Return value: ('scheme', <slot>) or ('srgb', <HEX>) or None.
+    kind is 'title' or 'subtitle'. 'auto' reads the template master's
+    titleStyle (for title) or bodyStyle (for subtitle); falls back to
+    accent1 / dk1 respectively.
     """
     if spec == "none":
         return None
     if spec == "auto":
-        resolved = _read_master_title_color(pres)
+        style_tag, default_scheme = (
+            ("titleStyle", "accent1") if kind == "title" else ("bodyStyle", "dk1")
+        )
+        resolved = _read_master_style_color(pres, style_tag)
         if resolved is None:
-            print("[info] could not read title color from template master; defaulting to accent1")
-            return ("scheme", "accent1")
-        print(f"[info] template title color detected: {resolved[0]}={resolved[1]}")
+            print(f"[info] could not read {kind} color from template master; "
+                  f"defaulting to {default_scheme}")
+            return ("scheme", default_scheme)
+        print(f"[info] template {kind} color detected: {resolved[0]}={resolved[1]}")
         return resolved
     if spec.startswith("#"):
         hex_ = spec.lstrip("#").upper()
         if not HEX_RE.match(hex_):
-            raise SystemExit(f"Invalid --title-color hex: {spec}")
+            raise SystemExit(f"Invalid --{kind}-color hex: {spec}")
         return ("srgb", hex_)
     if spec in THEME_COLOR_NAMES:
         return ("scheme", spec)
     raise SystemExit(
-        f"Invalid --title-color: {spec!r}. Use a theme slot name "
+        f"Invalid --{kind}-color: {spec!r}. Use a theme slot name "
         f"({', '.join(sorted(THEME_COLOR_NAMES))}), '#RRGGBB', 'auto', or 'none'."
     )
 
 
-def _read_master_title_color(pres):
-    """Read the master's titleStyle level-1 solid fill, as a ('scheme'|'srgb', value) tuple."""
+def _read_master_style_color(pres, style_tag: str):
+    """Read a master style (titleStyle/bodyStyle) level-1 solid fill."""
     master = pres.slide_masters[0]
-    title_style = master.element.find(f".//{{{P_NS}}}titleStyle")
-    if title_style is None:
+    style = master.element.find(f".//{{{P_NS}}}{style_tag}")
+    if style is None:
         return None
-    lvl1 = title_style.find(f"{{{A_NS}}}lvl1pPr")
+    lvl1 = style.find(f"{{{A_NS}}}lvl1pPr")
     if lvl1 is None:
         return None
     def_rpr = lvl1.find(f"{{{A_NS}}}defRPr")
@@ -377,27 +385,26 @@ def _read_master_title_color(pres):
     return None
 
 
-def _detect_title_shape(slide, slide_width, slide_height):
-    """Pick the shape that looks like a title.
+def _detect_title_and_subtitle(slide, slide_width, slide_height):
+    """Return (title_shape, subtitle_shape). Either may be None.
 
-    Primary heuristic: the *topmost shape that spans most of the slide width*
-    is the title. Titles are authored full-width near the top; decorative stat
-    cards / column boxes are narrower even when their font is larger.
-
-    Fallback (no wide shape — unusual layouts): the overall largest-font shape,
-    but only if it beats the next-largest by TITLE_SIZE_RATIO so we don't
-    mislabel one of several evenly-sized body lines.
+    Title: topmost text shape whose width >= TITLE_MIN_WIDTH_FRACTION of slide.
+    Subtitle: next wide shape below the title, still in the top
+      SUBTITLE_MAX_TOP_FRACTION of the slide (keeps footers out), and not
+      visibly larger than the title (avoids picking a secondary banner).
+    Fallback for title when no wide shape exists: largest-font with separation.
     """
     width_threshold = slide_width * TITLE_MIN_WIDTH_FRACTION
-    wide_candidates: list[tuple[int, float, object]] = []  # (top, max_size, shape)
-    all_candidates: list[tuple[float, int, object]] = []   # (max_size, top, shape)
+    subtitle_zone = slide_height * SUBTITLE_MAX_TOP_FRACTION
+    wide: list[tuple[int, float, object]] = []
+    all_text: list[tuple[float, int, object]] = []
 
     for sh in slide.shapes:
         if not sh.has_text_frame:
             continue
         text = (sh.text_frame.text or "").strip()
         if not text:
-            continue  # empty textboxes would steal "topmost" from the real title
+            continue
         max_size = 0.0
         for para in sh.text_frame.paragraphs:
             for run in para.runs:
@@ -406,27 +413,35 @@ def _detect_title_shape(slide, slide_width, slide_height):
                     max_size = size.pt
         top = sh.top if sh.top is not None else 0
         width = sh.width if sh.width is not None else 0
-        all_candidates.append((max_size, top, sh))
+        all_text.append((max_size, top, sh))
         if width >= width_threshold:
-            wide_candidates.append((top, max_size, sh))
+            wide.append((top, max_size, sh))
 
-    if wide_candidates:
-        wide_candidates.sort(key=lambda c: (c[0], -c[1]))
-        return wide_candidates[0][2]
+    title = None
+    subtitle = None
 
-    if not all_candidates:
-        return None
-    all_candidates.sort(key=lambda c: (-c[0], c[1]))
-    best_size, _, best_shape = all_candidates[0]
-    if best_size == 0:
-        return None
-    other_sizes = [c[0] for c in all_candidates[1:] if c[0] < best_size]
-    if other_sizes and best_size < other_sizes[0] * TITLE_SIZE_RATIO:
-        return None
-    return best_shape
+    if wide:
+        wide.sort(key=lambda c: (c[0], -c[1]))
+        _, title_size, title = wide[0]
+        for top, size, shape in wide[1:]:
+            if top > subtitle_zone:
+                break
+            if title_size > 0 and size > title_size * 1.05:
+                continue
+            subtitle = shape
+            break
+    elif all_text:
+        all_text.sort(key=lambda c: (-c[0], c[1]))
+        best_size, _, best_shape = all_text[0]
+        if best_size > 0:
+            other_sizes = [c[0] for c in all_text[1:] if c[0] < best_size]
+            if not other_sizes or best_size >= other_sizes[0] * TITLE_SIZE_RATIO:
+                title = best_shape
+
+    return title, subtitle
 
 
-def _apply_title_color(shape, color_spec):
+def _apply_shape_color(shape, color_spec):
     kind, value = color_spec
     for para in shape.text_frame.paragraphs:
         for run in para.runs:
@@ -437,34 +452,43 @@ def _apply_title_color(shape, color_spec):
                 color.rgb = RGBColor.from_string(value.lstrip("#"))
 
 
-def _recolor_titles(pres, color_spec):
-    """Apply color_spec to the detected title shape on every slide. Return log tuples."""
-    log = []
+def _recolor_titles_and_subtitles(pres, title_spec, subtitle_spec):
+    """Apply title_spec / subtitle_spec to detected shapes on every slide.
+
+    Either spec can be None (skip that pass). Returns (title_log, subtitle_log).
+    """
+    title_log: list[tuple[int, str]] = []
+    subtitle_log: list[tuple[int, str]] = []
     slide_width = pres.slide_width
     slide_height = pres.slide_height
     for idx, slide in enumerate(pres.slides):
-        title_shape = _detect_title_shape(slide, slide_width, slide_height)
-        if title_shape is None:
-            continue
-        _apply_title_color(title_shape, color_spec)
-        snippet = (title_shape.text_frame.text.strip().replace("\n", " ") or "")[:60]
-        log.append((idx + 1, snippet))
-    return log
+        title_shape, subtitle_shape = _detect_title_and_subtitle(slide, slide_width, slide_height)
+        if title_shape is not None and title_spec is not None:
+            _apply_shape_color(title_shape, title_spec)
+            title_log.append((idx + 1, _shape_text_snippet(title_shape)))
+        if subtitle_shape is not None and subtitle_spec is not None:
+            _apply_shape_color(subtitle_shape, subtitle_spec)
+            subtitle_log.append((idx + 1, _shape_text_snippet(subtitle_shape)))
+    return title_log, subtitle_log
 
 
-def _print_title_report(log, color_spec):
+def _shape_text_snippet(shape) -> str:
+    return (shape.text_frame.text.strip().replace("\n", " ") or "")[:60]
+
+
+def _print_style_report(log, color_spec, kind: str):
     print()
-    print("=== Title recolor report ===")
+    print(f"=== {kind.capitalize()} recolor report ===")
     if color_spec is None:
-        print("(skipped — title recoloring disabled)")
+        print(f"(skipped — {kind} recoloring disabled)")
         return
-    kind, value = color_spec
-    target = f"{kind}={value}" if kind == "scheme" else f"#{value}"
+    kind_tag, value = color_spec
+    target = f"{kind_tag}={value}" if kind_tag == "scheme" else f"#{value}"
     if not log:
-        print(f"(no slides matched the title heuristic; font-size gaps too small)")
+        print(f"(no slides matched the {kind} heuristic)")
         print(f"Target color was: {target}")
         return
-    print(f"Applied color {target} to {len(log)} slide title(s):")
+    print(f"Applied color {target} to {len(log)} slide {kind}(s):")
     for slide_num, text in log:
         print(f"  slide {slide_num}: {text!r}")
 
@@ -478,8 +502,13 @@ def main():
                     help="Optional JSON file mapping source hex colors to template theme slots "
                          "or hex literals. See mappings/keyhole_to_corporate.json for an example.")
     ap.add_argument("--title-color", default="auto",
-                    help="Color for detected slide titles: 'auto' (read from template master), "
-                         "'none' (skip), a theme slot name (e.g. 'accent1'), or '#RRGGBB'.")
+                    help="Color for detected slide titles: 'auto' (read from template master "
+                         "titleStyle), 'none' (skip), a theme slot name (e.g. 'accent1'), "
+                         "or '#RRGGBB'.")
+    ap.add_argument("--subtitle-color", default="auto",
+                    help="Color for detected slide subtitles (the 2nd wide shape below the "
+                         "title): 'auto' (read from template master bodyStyle), 'none' (skip), "
+                         "a theme slot name, or '#RRGGBB'.")
     args = ap.parse_args()
     for label, p in (("input", args.input), ("template", args.template)):
         if not p.exists():
@@ -487,7 +516,9 @@ def main():
     if args.color_map is not None and not args.color_map.exists():
         ap.error(f"color-map not found: {args.color_map}")
     convert(args.input, args.template, args.output,
-            color_map_path=args.color_map, title_color=args.title_color)
+            color_map_path=args.color_map,
+            title_color=args.title_color,
+            subtitle_color=args.subtitle_color)
 
 
 if __name__ == "__main__":

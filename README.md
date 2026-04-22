@@ -63,6 +63,25 @@ The color report at the end of each run lists every source color and whether
 it was remapped — iterate your mapping until the "still hardcoded" list is
 empty (or limited to colors you deliberately want to preserve).
 
+### Title and subtitle recoloring
+
+AI-generated decks almost always use absolutely-positioned text boxes rather
+than title placeholders, so the template's `titleStyle` / `bodyStyle` colors
+never get a chance to apply. `convert.py` detects the title and subtitle
+heuristically (topmost wide shape = title; next wide shape still near the top
+= subtitle) and rewrites their text color to match the template master.
+
+Override per-run with `--title-color` / `--subtitle-color`. Accepted values:
+
+- `auto` (default) — reads from template master `titleStyle` / `bodyStyle`.
+- `none` — skip that pass entirely.
+- a theme slot name: `dk1`, `lt1`, `dk2`, `lt2`, `tx1`, `tx2`, `bg1`, `bg2`,
+  `accent1` .. `accent6`, `hlink`, `folHlink`.
+- a `#RRGGBB` hex literal.
+
+The report at the end of each run lists the detected title and subtitle text
+for every slide so you can verify the heuristic didn't misfire.
+
 ## Sample fixtures
 
 - `input/sample_input.pptx` — a five-slide deck in the style of an AI-generated
