@@ -24,12 +24,44 @@ fixtures are tracked so the repo clones cleanly with something to test against.
 ```bash
 pip install -r requirements.txt
 
-# Convert the bundled sample fixtures:
+# Minimal theme swap — carries over theme colors, fonts, and master branding:
 python convert.py \
   --input    input/sample_input.pptx \
   --template template/sample_template.pptx \
   --output   output/sample_merged.pptx
+
+# With a color map — remaps source hardcoded RGBs onto template theme slots.
+# Essential for AI-generated decks that bake explicit colors into every shape.
+python convert.py \
+  --input    input/sample_input.pptx \
+  --template template/sample_template.pptx \
+  --output   output/sample_merged.pptx \
+  --color-map mappings/keyhole_to_corporate.json
 ```
+
+### Color map format
+
+`mappings/*.json`:
+
+```json
+{
+  "description": "...",
+  "map": {
+    "1A1A2E": "lt1",
+    "00D4FF": "accent1",
+    "FF4444": "#D32F2F"
+  }
+}
+```
+
+Keys are 6-hex source colors (no `#`). Values are either a theme-slot name
+(`dk1`, `lt1`, `dk2`, `lt2`, `accent1`–`accent6`) or a `#RRGGBB` literal.
+Theme-slot targets emit `<a:schemeClr>` references, so the color becomes
+theme-aware and will follow the template's theme if you later swap it.
+
+The color report at the end of each run lists every source color and whether
+it was remapped — iterate your mapping until the "still hardcoded" list is
+empty (or limited to colors you deliberately want to preserve).
 
 ## Sample fixtures
 

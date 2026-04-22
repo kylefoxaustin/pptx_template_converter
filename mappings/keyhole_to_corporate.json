@@ -1,0 +1,22 @@
+{
+  "description": "Starter mapping for keyhole-style dark-synthwave Claude decks onto a light corporate theme. Values are either a theme color name (dk1, lt1, dk2, lt2, accent1..accent6) or a '#RRGGBB' literal. Keys are 6-hex-digit uppercase source colors (no leading #). Iterate this file and re-run convert.py until it looks right.",
+  "map": {
+    "1A1A2E": "lt1",
+    "16213E": "lt1",
+    "222B4A": "lt2",
+    "1A2340": "lt1",
+    "0D47A1": "accent2",
+    "00D4FF": "accent1",
+    "00FF88": "accent3",
+    "00E676": "accent3",
+    "FF8C00": "accent5",
+    "F59E0B": "accent4",
+    "FF4444": "#D32F2F",
+    "6366F1": "accent2",
+    "BB86FC": "accent2",
+    "AAAACC": "dk2",
+    "E0E0FF": "dk1",
+    "FFFFFF": "lt1",
+    "000000": "dk1"
+  }
+}
